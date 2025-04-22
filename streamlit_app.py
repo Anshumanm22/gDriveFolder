@@ -17,6 +17,49 @@ auth_method = st.sidebar.radio(
     ["Service Account", "OAuth 2.0"]
 )
 
+def display_nested_structure(structure, source_folder_name=""):
+    """Convert the flat path structure to a nested dictionary for better visualization."""
+    nested = {}
+    
+    # First handle the root folder
+    if "" in structure and structure[""]:
+        for folder in structure[""]:
+            if folder == source_folder_name:
+                nested[folder] = {}
+    
+    # Then process all paths
+    for path in sorted(structure.keys(), key=lambda x: len(x.split(os.sep))):
+        if path == "":
+            continue  # Already handled root
+            
+        parts = path.split(os.sep)
+        current = nested
+        
+        # Navigate to the correct position in the nested structure
+        for part in parts:
+            if part in current:
+                current = current[part]
+            else:
+                # This shouldn't happen with a properly built structure
+                current[part] = {}
+                current = current[part]
+        
+        # Add the folders at this path level
+        for folder in structure[path]:
+            current[folder] = {}
+    
+    return nested
+
+def print_nested_structure(nested, indent=0):
+    """Print the nested structure with indentation."""
+    result = []
+    for key, value in nested.items():
+        result.append("  " * indent + f"└── {key}")
+        children = print_nested_structure(value, indent + 1)
+        result.extend(children)
+    return result
+
+
 def authenticate_with_service_account(credentials_content=None):
     """Authenticate using service account credentials."""
     if credentials_content:
@@ -88,7 +131,7 @@ def get_folder_structure(service, folder_id, is_shared_drive, drive_id=None, pat
         structure[path].append(folder_name)
         
         # List all files and folders in this folder - with support for shared drives
-        query = f"'{folder_id}' in parents and trashed = false"
+        query = f"'{folder_id}' in parents and trashed = false and mimeType = 'application/vnd.google-apps.folder'"
         list_params = {
             'q': query,
             'fields': "files(id, name, mimeType)",
@@ -99,13 +142,25 @@ def get_folder_structure(service, folder_id, is_shared_drive, drive_id=None, pat
             if drive_id:
                 list_params['driveId'] = drive_id
                 list_params['corpora'] = 'drive'
-                # Some versions use includeItemsFromAllDrives instead of includeTeamDriveItems
-                try:
-                    list_params['includeItemsFromAllDrives'] = True
-                except:
-                    list_params['includeTeamDriveItems'] = True
+            # Handle API differences
+            try:
+                list_params['includeItemsFromAllDrives'] = True
+            except Exception:
+                pass  # We'll handle this parameter in the try/except block later
         
-        results = service.files().list(**list_params).execute()
+        # Try with current API version first
+        try:
+            results = service.files().list(**list_params).execute()
+        except Exception as e:
+            # If it fails due to includeItemsFromAllDrives, try the older parameter
+            if 'includeItemsFromAllDrives' in str(e):
+                if 'includeItemsFromAllDrives' in list_params:
+                    del list_params['includeItemsFromAllDrives']
+                list_params['includeTeamDriveItems'] = True
+                results = service.files().list(**list_params).execute()
+            else:
+                raise e
+                
         items = results.get('files', [])
         
         # Update progress
@@ -121,27 +176,56 @@ def get_folder_structure(service, folder_id, is_shared_drive, drive_id=None, pat
     except Exception as e:
         if progress_callback:
             progress_callback(f"Error accessing {path}/{folder_id}: {str(e)}")
-            st.error(f"API Error: {str(e)}")
     
     return structure
-
+    
 def create_folder_structure(service, structure, source_folder_name, destination_folder_id, is_shared_drive, dest_drive_id=None, progress_callback=None):
     """Create the folder structure in the destination folder."""
     folder_id_map = {}  # Maps source paths to destination folder IDs
     folder_id_map[""] = destination_folder_id
     
-    # Process the structure level by level
-    for path in sorted(structure.keys(), key=lambda x: len(x.split(os.sep))):
-        parent_path = os.path.dirname(path)
+    # Explicitly handle the root folder
+    if "" in structure and source_folder_name in structure[""]:
+        folder_id_map[source_folder_name] = destination_folder_id
+    
+    # Debug output
+    if progress_callback:
+        progress_callback(f"Found {len(structure)} path entries in structure")
+        for path in structure:
+            progress_callback(f"Path: '{path}' contains folders: {structure[path]}")
+    
+    # Sort paths by depth to ensure parent folders are created before children
+    paths = sorted(structure.keys(), key=lambda x: x.count(os.sep))
+    if progress_callback:
+        progress_callback(f"Processing paths in order: {paths}")
+    
+    # Process each path level
+    for path in paths:
+        # Skip the root path as we already handled it
+        if path == "" and source_folder_name in structure[path]:
+            continue
+            
+        # Get parent path and ID
+        parent_path = os.path.dirname(path) if path else ""
+        
+        # Debug output
+        if progress_callback:
+            progress_callback(f"For path '{path}', parent path is '{parent_path}'")
+            
+        # Skip if parent path isn't in our map (this shouldn't happen with proper sorting)
+        if parent_path not in folder_id_map and path:
+            progress_callback(f"Warning: Parent path '{parent_path}' not found in folder map. Available paths: {list(folder_id_map.keys())}")
+            continue
+            
         parent_id = folder_id_map.get(parent_path, destination_folder_id)
         
+        # Create each folder in this path
         for folder_name in structure[path]:
-            # Skip the source folder itself
+            # Skip the source folder at the root level
             if path == "" and folder_name == source_folder_name:
-                folder_id_map[folder_name] = destination_folder_id
                 continue
                 
-            # Create folder - with support for shared drives
+            # Create folder with support for shared drives
             folder_metadata = {
                 'name': folder_name,
                 'mimeType': 'application/vnd.google-apps.folder',
@@ -153,16 +237,22 @@ def create_folder_structure(service, structure, source_folder_name, destination_
             if is_shared_drive:
                 params['supportsAllDrives'] = True
             
-            folder = service.files().create(body=folder_metadata, **params).execute()
-            new_folder_id = folder.get('id')
-            
-            # Add to our mapping
-            new_path = os.path.join(path, folder_name) if path else folder_name
-            folder_id_map[new_path] = new_folder_id
-            
-            # Update progress
-            if progress_callback:
-                progress_callback(f"Created: {new_path}")
+            try:
+                folder = service.files().create(body=folder_metadata, **params).execute()
+                new_folder_id = folder.get('id')
+                
+                # Calculate the full path for this new folder
+                new_path = os.path.join(path, folder_name) if path else folder_name
+                
+                # Add to our mapping
+                folder_id_map[new_path] = new_folder_id
+                
+                # Update progress
+                if progress_callback:
+                    progress_callback(f"Created: {new_path} (ID: {new_folder_id})")
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(f"Error creating folder '{folder_name}' in '{path}': {str(e)}")
     
     return folder_id_map
 
