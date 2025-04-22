@@ -74,12 +74,11 @@ def get_folder_structure(service, folder_id, is_shared_drive, drive_id=None, pat
     
     # Get folder name - with support for shared drives
     try:
-        params = {'fields': 'name,mimeType'}
+        params = {'fileId': folder_id, 'fields': 'name,mimeType'}
         if is_shared_drive:
             params['supportsAllDrives'] = True
-            params['includeItemsFromAllDrives'] = True
         
-        folder = service.files().get(fileId=folder_id, **params).execute()
+        folder = service.files().get(**params).execute()
         folder_name = folder.get('name')
         current_path = os.path.join(path, folder_name) if path else folder_name
         
@@ -90,19 +89,23 @@ def get_folder_structure(service, folder_id, is_shared_drive, drive_id=None, pat
         
         # List all files and folders in this folder - with support for shared drives
         query = f"'{folder_id}' in parents and trashed = false"
-        params = {
+        list_params = {
             'q': query,
             'fields': "files(id, name, mimeType)",
         }
         
         if is_shared_drive:
-            params['supportsAllDrives'] = True
-            params['includeItemsFromAllDrives'] = True
+            list_params['supportsAllDrives'] = True
             if drive_id:
-                params['driveId'] = drive_id
-                params['corpora'] = 'drive'
+                list_params['driveId'] = drive_id
+                list_params['corpora'] = 'drive'
+                # Some versions use includeItemsFromAllDrives instead of includeTeamDriveItems
+                try:
+                    list_params['includeItemsFromAllDrives'] = True
+                except:
+                    list_params['includeTeamDriveItems'] = True
         
-        results = service.files().list(**params).execute()
+        results = service.files().list(**list_params).execute()
         items = results.get('files', [])
         
         # Update progress
@@ -118,6 +121,7 @@ def get_folder_structure(service, folder_id, is_shared_drive, drive_id=None, pat
     except Exception as e:
         if progress_callback:
             progress_callback(f"Error accessing {path}/{folder_id}: {str(e)}")
+            st.error(f"API Error: {str(e)}")
     
     return structure
 
@@ -168,7 +172,6 @@ def validate_folder_id(service, folder_id, is_shared_drive=False):
         params = {'fileId': folder_id, 'fields': "name, mimeType, driveId"}
         if is_shared_drive:
             params['supportsAllDrives'] = True
-            params['includeItemsFromAllDrives'] = True
         
         folder = service.files().get(**params).execute()
         
@@ -186,17 +189,30 @@ def get_shared_drives(service):
         shared_drives = []
         page_token = None
         
-        while True:
-            response = service.drives().list(pageSize=100, pageToken=page_token).execute()
-            shared_drives.extend(response.get('drives', []))
-            page_token = response.get('nextPageToken')
-            if not page_token:
-                break
+        # Try newer API first
+        try:
+            while True:
+                response = service.drives().list(pageSize=100, pageToken=page_token).execute()
+                shared_drives.extend(response.get('drives', []))
+                page_token = response.get('nextPageToken')
+                if not page_token:
+                    break
+        except:
+            # If newer API fails, try with teamdrives() instead
+            while True:
+                response = service.teamdrives().list(pageSize=100, pageToken=page_token).execute()
+                shared_drives.extend(response.get('teamDrives', []))
+                page_token = response.get('nextPageToken')
+                if not page_token:
+                    break
                 
         return shared_drives
     except Exception as e:
         st.sidebar.error(f"Error retrieving shared drives: {str(e)}")
         return []
+
+# Add Debug Mode
+debug_mode = st.sidebar.checkbox("Debug Mode", value=False)
 
 # Sidebar for authentication
 with st.sidebar:
@@ -250,10 +266,17 @@ with st.sidebar:
         shared_drives = get_shared_drives(st.session_state.drive_service)
         
         if shared_drives:
-            drive_names = [f"{drive['name']} ({drive['id']})" for drive in shared_drives]
-            st.write("Shared Drives accessible to you:")
-            for drive_name in drive_names:
-                st.write(f"- {drive_name}")
+            drive_ids = []
+            for drive in shared_drives:
+                # Handle different API responses
+                drive_id = drive.get('id') or drive.get('driveId') or drive.get('teamDriveId')
+                drive_name = drive.get('name')
+                if drive_id and drive_name:
+                    st.write(f"- {drive_name} ({drive_id})")
+                    drive_ids.append(drive_id)
+            
+            if debug_mode and drive_ids:
+                st.text_area("Shared Drive IDs (for debug)", value="\n".join(drive_ids))
         else:
             st.info("No shared drives found or insufficient permissions.")
 
@@ -277,6 +300,8 @@ with col1:
             if drive_id:
                 source_drive_id = drive_id
                 st.info(f"Part of Shared Drive with ID: {drive_id}")
+                if debug_mode:
+                    st.text_input("Source Drive ID (for debug)", value=drive_id)
         else:
             st.error(name)
 
@@ -293,8 +318,21 @@ with col2:
             if drive_id:
                 dest_drive_id = drive_id
                 st.info(f"Part of Shared Drive with ID: {drive_id}")
+                if debug_mode:
+                    st.text_input("Destination Drive ID (for debug)", value=drive_id)
         else:
             st.error(name)
+
+# Manual drive ID entry for problematic cases
+if debug_mode:
+    st.subheader("Manual Drive ID Override (Debug)")
+    manual_source_drive_id = st.text_input("Manual Source Drive ID")
+    if manual_source_drive_id:
+        source_drive_id = manual_source_drive_id
+    
+    manual_dest_drive_id = st.text_input("Manual Destination Drive ID")
+    if manual_dest_drive_id:
+        dest_drive_id = manual_dest_drive_id
 
 if st.button("Replicate Folder Structure") and 'drive_service' in st.session_state:
     if not source_folder_id or not destination_folder_id:
@@ -309,7 +347,6 @@ if st.button("Replicate Folder Structure") and 'drive_service' in st.session_sta
             params = {'fileId': source_folder_id, 'fields': "name"}
             if use_shared_drive:
                 params['supportsAllDrives'] = True
-                params['includeItemsFromAllDrives'] = True
             
             source_folder = st.session_state.drive_service.files().get(**params).execute()
             source_folder_name = source_folder.get('name')
@@ -348,9 +385,12 @@ if st.button("Replicate Folder Structure") and 'drive_service' in st.session_sta
             
         except Exception as e:
             st.error(f"Error: {str(e)}")
+            if debug_mode:
+                import traceback
+                st.code(traceback.format_exc())
 
 # Instructions
-with st.expander("Instructions for Shared Drives"):
+with st.expander("Instructions & Troubleshooting"):
     st.markdown("""
     ### Working with Shared Drives (Team Drives)
     
@@ -369,16 +409,25 @@ with st.expander("Instructions for Shared Drives"):
     4. **Available Shared Drives**:
        - After authenticating, your accessible shared drives will be listed in the sidebar
        
-    ### Common Issues
+    ### Common Issues & Solutions
     
+    - **"includeItemsFromAllDrives" error**:
+      - Enable Debug Mode and try running again
+      - The app will attempt to use compatible parameters for your API version
+      
     - **404 Errors**: 
       - Make sure the "Working with Shared Drives" checkbox is enabled
       - Verify you have proper permissions
       - Confirm the folder ID is correct
+      - Try enabling Debug Mode and manually enter the Drive ID
       
     - **Permission Issues**:
       - For service accounts, add the service account email to the shared drive
       - For OAuth, ensure your account has access to both source and destination
+      
+    - **API Compatibility Issues**:
+      - If you encounter strange API errors, enable Debug Mode
+      - Use the manual Drive ID override if automatic detection fails
     """)
 
 st.sidebar.markdown("---")
