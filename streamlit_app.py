@@ -9,6 +9,7 @@ from google.auth.transport.requests import Request
 
 st.set_page_config(page_title="Google Drive Folder Replicator", layout="wide")
 st.title("Google Drive Folder Structure Replicator")
+st.subheader("With Shared Drive Support")
 
 # Authentication methods
 auth_method = st.sidebar.radio(
@@ -66,41 +67,61 @@ def authenticate_with_oauth():
     service = build('drive', 'v3', credentials=creds)
     return service
 
-def get_folder_structure(service, folder_id, path="", structure=None, progress_callback=None):
+def get_folder_structure(service, folder_id, is_shared_drive, drive_id=None, path="", structure=None, progress_callback=None):
     """Recursively get the folder structure starting from a folder ID."""
     if structure is None:
         structure = {}
     
-    # Get folder name
-    folder = service.files().get(fileId=folder_id, fields="name").execute()
-    folder_name = folder.get('name')
-    current_path = os.path.join(path, folder_name) if path else folder_name
+    # Get folder name - with support for shared drives
+    try:
+        params = {'fields': 'name,mimeType'}
+        if is_shared_drive:
+            params['supportsAllDrives'] = True
+            params['includeItemsFromAllDrives'] = True
+        
+        folder = service.files().get(fileId=folder_id, **params).execute()
+        folder_name = folder.get('name')
+        current_path = os.path.join(path, folder_name) if path else folder_name
+        
+        # Add folder to structure
+        if path not in structure:
+            structure[path] = []
+        structure[path].append(folder_name)
+        
+        # List all files and folders in this folder - with support for shared drives
+        query = f"'{folder_id}' in parents and trashed = false"
+        params = {
+            'q': query,
+            'fields': "files(id, name, mimeType)",
+        }
+        
+        if is_shared_drive:
+            params['supportsAllDrives'] = True
+            params['includeItemsFromAllDrives'] = True
+            if drive_id:
+                params['driveId'] = drive_id
+                params['corpora'] = 'drive'
+        
+        results = service.files().list(**params).execute()
+        items = results.get('files', [])
+        
+        # Update progress
+        if progress_callback:
+            progress_callback(f"Reading: {current_path}")
+        
+        # Process each item
+        for item in items:
+            if item['mimeType'] == 'application/vnd.google-apps.folder':
+                # It's a folder, recursively process it
+                get_folder_structure(service, item['id'], is_shared_drive, drive_id, current_path, structure, progress_callback)
     
-    # Add folder to structure
-    if path not in structure:
-        structure[path] = []
-    structure[path].append(folder_name)
-    
-    # List all files and folders in this folder
-    query = f"'{folder_id}' in parents and trashed = false"
-    results = service.files().list(
-        q=query,
-        fields="files(id, name, mimeType)").execute()
-    items = results.get('files', [])
-    
-    # Update progress
-    if progress_callback:
-        progress_callback(f"Reading: {current_path}")
-    
-    # Process each item
-    for item in items:
-        if item['mimeType'] == 'application/vnd.google-apps.folder':
-            # It's a folder, recursively process it
-            get_folder_structure(service, item['id'], current_path, structure, progress_callback)
+    except Exception as e:
+        if progress_callback:
+            progress_callback(f"Error accessing {path}/{folder_id}: {str(e)}")
     
     return structure
 
-def create_folder_structure(service, structure, source_folder_name, destination_folder_id, progress_callback=None):
+def create_folder_structure(service, structure, source_folder_name, destination_folder_id, is_shared_drive, dest_drive_id=None, progress_callback=None):
     """Create the folder structure in the destination folder."""
     folder_id_map = {}  # Maps source paths to destination folder IDs
     folder_id_map[""] = destination_folder_id
@@ -116,14 +137,19 @@ def create_folder_structure(service, structure, source_folder_name, destination_
                 folder_id_map[folder_name] = destination_folder_id
                 continue
                 
-            # Create folder
+            # Create folder - with support for shared drives
             folder_metadata = {
                 'name': folder_name,
                 'mimeType': 'application/vnd.google-apps.folder',
                 'parents': [parent_id]
             }
             
-            folder = service.files().create(body=folder_metadata, fields='id').execute()
+            # Add parameters for shared drives if needed
+            params = {'fields': 'id'}
+            if is_shared_drive:
+                params['supportsAllDrives'] = True
+            
+            folder = service.files().create(body=folder_metadata, **params).execute()
             new_folder_id = folder.get('id')
             
             # Add to our mapping
@@ -136,15 +162,41 @@ def create_folder_structure(service, structure, source_folder_name, destination_
     
     return folder_id_map
 
-def validate_folder_id(service, folder_id):
+def validate_folder_id(service, folder_id, is_shared_drive=False):
     """Validate that a folder ID exists and is accessible."""
     try:
-        folder = service.files().get(fileId=folder_id, fields="name, mimeType").execute()
+        params = {'fileId': folder_id, 'fields': "name, mimeType, driveId"}
+        if is_shared_drive:
+            params['supportsAllDrives'] = True
+            params['includeItemsFromAllDrives'] = True
+        
+        folder = service.files().get(**params).execute()
+        
         if folder['mimeType'] != 'application/vnd.google-apps.folder':
-            return False, "The provided ID is not a folder"
-        return True, folder['name']
+            return False, "The provided ID is not a folder", None
+        
+        drive_id = folder.get('driveId', None)
+        return True, folder['name'], drive_id
     except Exception as e:
-        return False, f"Error accessing folder: {str(e)}"
+        return False, f"Error accessing folder: {str(e)}", None
+
+def get_shared_drives(service):
+    """Get a list of shared drives the user has access to."""
+    try:
+        shared_drives = []
+        page_token = None
+        
+        while True:
+            response = service.drives().list(pageSize=100, pageToken=page_token).execute()
+            shared_drives.extend(response.get('drives', []))
+            page_token = response.get('nextPageToken')
+            if not page_token:
+                break
+                
+        return shared_drives
+    except Exception as e:
+        st.sidebar.error(f"Error retrieving shared drives: {str(e)}")
+        return []
 
 # Sidebar for authentication
 with st.sidebar:
@@ -189,26 +241,58 @@ with st.sidebar:
                     except Exception as e:
                         st.error(f"Authentication error: {str(e)}")
 
+    # Shared Drive options
+    st.header("Drive Options")
+    use_shared_drive = st.checkbox("Working with Shared Drives", value=True)
+    
+    if use_shared_drive and 'drive_service' in st.session_state:
+        st.subheader("Available Shared Drives")
+        shared_drives = get_shared_drives(st.session_state.drive_service)
+        
+        if shared_drives:
+            drive_names = [f"{drive['name']} ({drive['id']})" for drive in shared_drives]
+            st.write("Shared Drives accessible to you:")
+            for drive_name in drive_names:
+                st.write(f"- {drive_name}")
+        else:
+            st.info("No shared drives found or insufficient permissions.")
+
 # Main content
 st.header("Folder Structure Replication")
 
 col1, col2 = st.columns(2)
+source_drive_id = None
+dest_drive_id = None
 
 with col1:
     source_folder_id = st.text_input("Source Folder ID", help="ID of the folder structure you want to copy")
     if source_folder_id and 'drive_service' in st.session_state:
-        valid, name = validate_folder_id(st.session_state.drive_service, source_folder_id)
+        valid, name, drive_id = validate_folder_id(
+            st.session_state.drive_service, 
+            source_folder_id,
+            is_shared_drive=use_shared_drive
+        )
         if valid:
             st.success(f"Source folder: {name}")
+            if drive_id:
+                source_drive_id = drive_id
+                st.info(f"Part of Shared Drive with ID: {drive_id}")
         else:
             st.error(name)
 
 with col2:
     destination_folder_id = st.text_input("Destination Folder ID", help="ID of the folder where structure will be created")
     if destination_folder_id and 'drive_service' in st.session_state:
-        valid, name = validate_folder_id(st.session_state.drive_service, destination_folder_id)
+        valid, name, drive_id = validate_folder_id(
+            st.session_state.drive_service, 
+            destination_folder_id,
+            is_shared_drive=use_shared_drive
+        )
         if valid:
             st.success(f"Destination folder: {name}")
+            if drive_id:
+                dest_drive_id = drive_id
+                st.info(f"Part of Shared Drive with ID: {drive_id}")
         else:
             st.error(name)
 
@@ -222,7 +306,12 @@ if st.button("Replicate Folder Structure") and 'drive_service' in st.session_sta
             status_text = st.empty()
             
             # Get source folder name
-            source_folder = st.session_state.drive_service.files().get(fileId=source_folder_id, fields="name").execute()
+            params = {'fileId': source_folder_id, 'fields': "name"}
+            if use_shared_drive:
+                params['supportsAllDrives'] = True
+                params['includeItemsFromAllDrives'] = True
+            
+            source_folder = st.session_state.drive_service.files().get(**params).execute()
             source_folder_name = source_folder.get('name')
             
             # Get folder structure
@@ -230,6 +319,8 @@ if st.button("Replicate Folder Structure") and 'drive_service' in st.session_sta
             structure = get_folder_structure(
                 st.session_state.drive_service, 
                 source_folder_id,
+                is_shared_drive=use_shared_drive,
+                drive_id=source_drive_id,
                 progress_callback=lambda msg: status_text.text(msg)
             )
             
@@ -247,6 +338,8 @@ if st.button("Replicate Folder Structure") and 'drive_service' in st.session_sta
                 structure, 
                 source_folder_name, 
                 destination_folder_id,
+                is_shared_drive=use_shared_drive,
+                dest_drive_id=dest_drive_id,
                 progress_callback=lambda msg: status_text.text(msg)
             )
             
@@ -257,31 +350,35 @@ if st.button("Replicate Folder Structure") and 'drive_service' in st.session_sta
             st.error(f"Error: {str(e)}")
 
 # Instructions
-with st.expander("Instructions"):
+with st.expander("Instructions for Shared Drives"):
     st.markdown("""
-    ### How to use this app
+    ### Working with Shared Drives (Team Drives)
     
-    1. **Authentication**:
-       - Choose your authentication method in the sidebar
-       - Upload the required credentials file
-       
-    2. **Get Folder IDs**:
-       - In Google Drive, navigate to the folder
-       - From the URL, copy the ID (the long string after "folders/" in the URL)
-       
-    3. **Replicate Structure**:
-       - Enter the source folder ID (the folder structure you want to copy)
-       - Enter the destination folder ID (where you want to create the structure)
-       - Click "Replicate Folder Structure"
-       
-    4. **Monitor Progress**:
-       - The app will show the progress as it reads and creates folders
-       - Once complete, you can check your Google Drive to see the replicated structure
-       
-    ### Notes
+    1. **Enable Shared Drive support**:
+       - Check the "Working with Shared Drives" box in the sidebar
     
-    - This app only replicates the folder structure, not the files
-    - Make sure your service account or user has proper permissions on both folders
+    2. **Find Folder IDs in Shared Drives**:
+       - Open the folder in your browser
+       - The ID is in the URL after "folders/" (example: https://drive.google.com/drive/u/0/folders/1ABCdefGHIjkLMnop)
+       - For Shared Drive root folders, the ID is after "drives/" in the URL
+       
+    3. **Permissions**:
+       - Your service account must be added to the shared drive with appropriate permissions
+       - Or your account must have access if using OAuth
+       
+    4. **Available Shared Drives**:
+       - After authenticating, your accessible shared drives will be listed in the sidebar
+       
+    ### Common Issues
+    
+    - **404 Errors**: 
+      - Make sure the "Working with Shared Drives" checkbox is enabled
+      - Verify you have proper permissions
+      - Confirm the folder ID is correct
+      
+    - **Permission Issues**:
+      - For service accounts, add the service account email to the shared drive
+      - For OAuth, ensure your account has access to both source and destination
     """)
 
 st.sidebar.markdown("---")
