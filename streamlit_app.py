@@ -454,17 +454,17 @@ if st.button("Replicate Folder Structure") and 'drive_service' in st.session_sta
             # Display the structure
             
            with st.expander("Folder Structure (Tree View)"):
-           if structure:    
-            nested_structure = display_nested_structure(structure, source_folder_name)
-            tree_lines = print_nested_structure(nested_structure)
+               if structure:    
+                nested_structure = display_nested_structure(structure, source_folder_name)
+                tree_lines = print_nested_structure(nested_structure)
         
             # Display the tree structure
-            for line in tree_lines:
-                st.text(line)
+                for line in tree_lines:
+                    st.text(line)
             
             # Also show raw structure for debugging
             with st.expander("Raw Structure Data"):
-            st.json(structure)
+                st.json(structure)
             
             # Create structure in destination
             status_text.text("Replicating folder structure...")
